@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 
 use rustic_core::{
-    CommandInput, Id, NoProgressBars, RepositoryBackends, RepositoryOptions, repofile::PackId,
+    repofile::PackId, CommandInput, Id, NoProgressBars, RepositoryBackends, RepositoryOptions,
 };
 use rustic_testing::backend::in_memory_backend::InMemoryBackend;
 
@@ -27,11 +27,11 @@ const PACK_ID_HEX_LENGTH: usize = 64;
 /// Returns the tempdir (to keep it alive) and the command
 ///
 /// # Arguments
-/// * `log_file` - Path to log file where invocations will be recorded
+/// * `log_dir` - Directory where log files will be recorded (each process writes to its own file)
 /// * `exit_code` - Exit code the script should return (0 for success, non-zero for failure)
 #[cfg(not(windows))]
 fn create_test_script_with_exit_code(
-    log_file: &Path,
+    log_dir: &Path,
     exit_code: i32,
 ) -> Result<(tempfile::TempDir, CommandInput)> {
     let dir = tempdir()?;
@@ -41,7 +41,7 @@ fn create_test_script_with_exit_code(
         "test_warm_up_fail.sh"
     };
     let script_path = dir.path().join(script_name);
-    let log_path = log_file.to_string_lossy();
+    let log_dir_path = log_dir.to_string_lossy();
 
     let exit_line = if exit_code == 0 {
         String::new()
@@ -51,18 +51,16 @@ fn create_test_script_with_exit_code(
 
     let script_content = format!(
         r#"#!/usr/bin/env bash
-# Log that the script was called (with file locking to prevent interleaving)
-(
-  flock -x 200
-  echo "CALL" >> {log_path}
-  # Log the number of arguments
-  echo "ARGC:$#" >> {log_path}
-  # Log each argument
-  for arg in "$@"; do
-    echo "ARG:$arg" >> {log_path}
-  done
-  {exit_line}
-) 200>"{log_path}.lock"
+# Log that the script was called (each process writes to its own file to avoid interleaving)
+LOG_FILE="{log_dir_path}/warmup_$$.log"
+echo "CALL" >> "$LOG_FILE"
+# Log the number of arguments
+echo "ARGC:$#" >> "$LOG_FILE"
+# Log each argument
+for arg in "$@"; do
+  echo "ARG:$arg" >> "$LOG_FILE"
+done
+{exit_line}
 "#,
     );
 
@@ -99,42 +97,55 @@ fn create_test_script_with_exit_code(
 
 /// Helper to create a test script that succeeds
 #[cfg(not(windows))]
-fn create_test_script(log_file: &Path) -> Result<(tempfile::TempDir, CommandInput)> {
-    create_test_script_with_exit_code(log_file, 0)
+fn create_test_script(log_dir: &Path) -> Result<(tempfile::TempDir, CommandInput)> {
+    create_test_script_with_exit_code(log_dir, 0)
 }
 
 /// Helper to create a test script that fails (exits with non-zero status)
 #[cfg(not(windows))]
-fn create_failing_script(log_file: &Path) -> Result<(tempfile::TempDir, CommandInput)> {
-    create_test_script_with_exit_code(log_file, 1)
+fn create_failing_script(log_dir: &Path) -> Result<(tempfile::TempDir, CommandInput)> {
+    create_test_script_with_exit_code(log_dir, 1)
 }
 
-/// Helper to parse log file and extract call count and arguments
+/// Helper to parse log files in a directory and extract call count and arguments
 #[cfg(not(windows))]
-fn parse_log_file(log_file: &Path) -> Result<(usize, Vec<Vec<String>>)> {
-    let mut content = String::new();
-    let _ = File::open(log_file)?.read_to_string(&mut content)?;
-
-    let lines: Vec<&str> = content.lines().collect();
-    let call_count = lines.iter().filter(|line| **line == "CALL").count();
-
+fn parse_log_files(log_dir: &Path) -> Result<(usize, Vec<Vec<String>>)> {
     let mut all_args = Vec::new();
-    let mut current_args = Vec::new();
 
-    for line in lines {
-        if line == "CALL" {
-            if !current_args.is_empty() {
-                all_args.push(current_args.clone());
-                current_args.clear();
+    // Read all log files matching the pattern warmup_*.log
+    for entry in fs::read_dir(log_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_file() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("warmup_") && name.ends_with(".log") {
+                    let mut content = String::new();
+                    let _ = File::open(&path)?.read_to_string(&mut content)?;
+
+                    let lines: Vec<&str> = content.lines().collect();
+                    let mut current_args = Vec::new();
+
+                    for line in lines {
+                        if line == "CALL" {
+                            if !current_args.is_empty() {
+                                all_args.push(current_args.clone());
+                                current_args.clear();
+                            }
+                        } else if let Some(arg) = line.strip_prefix("ARG:") {
+                            current_args.push(arg.to_string());
+                        }
+                    }
+
+                    if !current_args.is_empty() {
+                        all_args.push(current_args);
+                    }
+                }
             }
-        } else if let Some(arg) = line.strip_prefix("ARG:") {
-            current_args.push(arg.to_string());
         }
     }
 
-    if !current_args.is_empty() {
-        all_args.push(current_args);
-    }
+    let call_count = all_args.len();
 
     Ok((call_count, all_args))
 }
@@ -168,16 +179,16 @@ fn create_test_repo(
     rustic_core::Repository::new(&options, &be).map_err(Into::into)
 }
 
-/// Helper to parse log file and assert call count
+/// Helper to parse log files and assert call count
 /// Returns the parsed arguments for further verification
 #[cfg(not(windows))]
-fn assert_call_count(log_file: &Path, expected: usize, context: &str) -> Result<Vec<Vec<String>>> {
-    let (call_count, all_args) = parse_log_file(log_file)?;
+fn assert_call_count(log_dir: &Path, expected: usize, context: &str) -> Result<Vec<Vec<String>>> {
+    let (call_count, all_args) = parse_log_files(log_dir)?;
     assert_eq!(call_count, expected, "{context}");
     Ok(all_args)
 }
 
-/// Helper to verify batch distribution across multiple calls
+/// Helper to verify batch distribution across multiple calls (order-independent)
 #[cfg(not(windows))]
 fn verify_batch_distribution(all_args: &[Vec<String>], num_packs: usize, batch_size: usize) {
     // Verify total arguments across all calls equals number of packs
@@ -187,25 +198,42 @@ fn verify_batch_distribution(all_args: &[Vec<String>], num_packs: usize, batch_s
         "Total arguments should equal number of packs"
     );
 
-    // Verify each call has the expected batch size (except possibly the last one)
-    for (i, args) in all_args.iter().enumerate() {
-        let expected_batch = if i == all_args.len() - 1 {
-            // Last batch might be smaller
-            let remainder = num_packs % batch_size;
-            if remainder == 0 {
-                batch_size
-            } else {
-                remainder
-            }
-        } else {
-            batch_size
-        };
+    // Calculate expected batch sizes
+    let num_full_batches = num_packs / batch_size;
+    let remainder = num_packs % batch_size;
+
+    // Count actual batch sizes
+    let mut size_counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for args in all_args {
+        *size_counts.entry(args.len()).or_insert(0) += 1;
+    }
+
+    // Verify full batch count
+    if num_full_batches > 0 {
         assert_eq!(
-            args.len(),
-            expected_batch,
-            "Call {} should have {} arguments",
-            i + 1,
-            expected_batch
+            size_counts.get(&batch_size).copied().unwrap_or(0),
+            num_full_batches,
+            "Should have {} batches of size {}, got {:?}",
+            num_full_batches,
+            batch_size,
+            size_counts
+        );
+    }
+
+    // Verify remainder batch (if any)
+    if remainder > 0 {
+        assert_eq!(
+            size_counts.get(&remainder).copied().unwrap_or(0),
+            1,
+            "Should have 1 batch of size {}, got {:?}",
+            remainder,
+            size_counts
+        );
+    } else {
+        assert!(
+            !size_counts.contains_key(&batch_size) || size_counts.len() == 1,
+            "No remainder expected, but found multiple batch sizes: {:?}",
+            size_counts
         );
     }
 }
@@ -224,8 +252,7 @@ fn test_warm_up_batch_args_mode(
     #[case] expected_calls: usize,
 ) -> Result<()> {
     let log_dir = tempdir()?;
-    let log_file = log_dir.path().join("warmup.log");
-    let (_script_dir, mut command) = create_test_script(&log_file)?;
+    let (_script_dir, mut command) = create_test_script(log_dir.path())?;
 
     // Modify command to include %ids placeholder for plural mode
     let cmd_str = format!("{} %ids", command.command());
@@ -237,7 +264,7 @@ fn test_warm_up_batch_args_mode(
     repo.warm_up(pack_ids.iter().copied())?;
 
     let all_args = assert_call_count(
-        &log_file,
+        log_dir.path(),
         expected_calls,
         &format!("Command should be called {expected_calls} times"),
     )?;
@@ -257,8 +284,7 @@ fn test_warm_up_batch_variable_mode(
     #[case] expected_calls: usize,
 ) -> Result<()> {
     let log_dir = tempdir()?;
-    let log_file = log_dir.path().join("warmup.log");
-    let (_script_dir, mut command) = create_test_script(&log_file)?;
+    let (_script_dir, mut command) = create_test_script(log_dir.path())?;
 
     // Modify command to include %id placeholder for singular mode
     let cmd_str = format!("{} %id", command.command());
@@ -270,7 +296,7 @@ fn test_warm_up_batch_variable_mode(
     repo.warm_up(pack_ids.iter().copied())?;
 
     let all_args = assert_call_count(
-        &log_file,
+        log_dir.path(),
         expected_calls,
         &format!("Command should be called {expected_calls} times in singular mode"),
     )?;
@@ -299,16 +325,16 @@ fn test_warm_up_parallel_anchor_mode(
     #[case] max_ms: u128,
 ) -> Result<()> {
     let log_dir = tempdir()?;
-    let log_file = log_dir.path().join("warmup.log");
+    let log_dir_path = log_dir.path().to_string_lossy();
 
     // Script that sleeps for 200ms and logs calls
     let dir = tempdir()?;
     let script_path = dir.path().join("sleep_warm_up.sh");
-    let log_path = log_file.to_string_lossy();
 
     let script_content = format!(
         r#"#!/usr/bin/env bash
-echo "CALL:$1:$(date +%s%3N)" >> {log_path}
+LOG_FILE="{log_dir_path}/warmup_$$.log"
+echo "CALL:$1:$(date +%s%3N)" >> "$LOG_FILE"
 sleep 0.2
 "#,
     );
@@ -462,8 +488,7 @@ fn test_validation_valid_plural_placeholders() -> Result<()> {
 #[test]
 fn test_warm_up_argv_mode_with_existing_args() -> Result<()> {
     let log_dir = tempdir()?;
-    let log_file = log_dir.path().join("warmup.log");
-    let (_script_dir, command) = create_test_script(&log_file)?;
+    let (_script_dir, command) = create_test_script(log_dir.path())?;
 
     // Add extra arguments and %ids placeholder to the command
     let cmd_str = format!("{} --flag value %ids", command.command());
@@ -475,7 +500,7 @@ fn test_warm_up_argv_mode_with_existing_args() -> Result<()> {
     repo.warm_up(pack_ids.iter().copied())?;
 
     let all_args = assert_call_count(
-        &log_file,
+        log_dir.path(),
         1,
         "Should be called once with batch_size=5 and 3 packs",
     )?;
@@ -598,8 +623,7 @@ fn test_warm_up_command_failure(
     #[case] needs_id_placeholder: bool,
 ) -> Result<()> {
     let log_dir = tempdir()?;
-    let log_file = log_dir.path().join("warmup.log");
-    let (_script_dir, mut command) = create_failing_script(&log_file)?;
+    let (_script_dir, mut command) = create_failing_script(log_dir.path())?;
 
     if needs_id_placeholder {
         let cmd_str = format!("{} {}", command.command(), placeholder);
@@ -623,7 +647,7 @@ fn test_warm_up_command_failure(
         "Error should indicate command failure: {err_str}"
     );
 
-    let (call_count, _) = parse_log_file(&log_file)?;
+    let (call_count, _) = parse_log_files(log_dir.path())?;
     assert_eq!(
         call_count, expected_calls,
         "Script should have been called {expected_calls} times before failing"
@@ -636,8 +660,7 @@ fn test_warm_up_command_failure(
 #[test]
 fn test_warm_up_backend_path_mode() -> Result<()> {
     let log_dir = tempdir()?;
-    let log_file = log_dir.path().join("warmup.log");
-    let (_script_dir, mut command) = create_test_script(&log_file)?;
+    let (_script_dir, mut command) = create_test_script(log_dir.path())?;
 
     // Add %paths placeholder to use backend paths instead of pack IDs
     let cmd_str = format!("{} %paths", command.command());
@@ -653,7 +676,7 @@ fn test_warm_up_backend_path_mode() -> Result<()> {
 
     // Verify the warmup command was called once with backend paths
     let all_args = assert_call_count(
-        &log_file,
+        log_dir.path(),
         1,
         "Command should be called once with backend paths",
     )?;
